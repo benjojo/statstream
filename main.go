@@ -2,25 +2,50 @@ package main
 
 import (
 	"flag"
-	"github.com/tuxychandru/pubsub"
 	"golang.org/x/net/websocket"
+	"gopkg.in/redis.v3"
 	"io/ioutil"
 	"net/http"
 	"strings"
 )
 
-var PubSub *pubsub.PubSub
+var (
+	bindaddr    = flag.String("bind", "127.0.0.1:1189", "http bind")
+	redisaddr   = flag.String("redis", "localhost:6379", "redis address")
+	redistopic  = flag.String("redis-topic", "collectd", "the redis pubsub topic")
+	PublishChan chan string
+)
 
 func main() {
-	PubSub = pubsub.New(20)
-	bindaddr := flag.String("bind", "127.0.0.1:1189", "http bind")
 	flag.Parse()
+
+	PublishChan = make(chan string)
+	go Publisher()
 
 	http.HandleFunc("/poststat", addStat)
 	http.Handle("/statstream", websocket.Handler(streamStats))
 	err := http.ListenAndServe(*bindaddr, nil)
 	if err != nil {
 		panic("ListenAndServe: " + err.Error())
+	}
+}
+
+func Publisher() {
+	client := redis.NewClient(&redis.Options{
+		Addr:     *redisaddr,
+		Password: "", // no password set
+		DB:       0,  // use default DB
+	})
+
+	for msg := range PublishChan {
+		if client.Publish(*redistopic, msg).Err() != nil {
+			client.Close()
+			client = redis.NewClient(&redis.Options{
+				Addr:     *redisaddr,
+				Password: "", // no password set
+				DB:       0,  // use default DB
+			})
+		}
 	}
 }
 
@@ -35,7 +60,7 @@ func addStat(rw http.ResponseWriter, req *http.Request) {
 
 	for _, v := range lines {
 		if v != "" {
-			PubSub.Pub(v, "data")
+			PublishChan <- v
 		}
 	}
 }
@@ -45,22 +70,32 @@ func streamStats(ws *websocket.Conn) {
 
 	grep := ws.Request().URL.Query().Get("grep")
 
-	// inbound := make(chan interface{})
+	client := redis.NewClient(&redis.Options{
+		Addr:     *redisaddr,
+		Password: "", // no password set
+		DB:       0,  // use default DB
+	})
 
-	inbound := PubSub.Sub("data")
+	defer client.Close()
 
-	// PubSub.AddSub(inbound, "data")
-	defer PubSub.Unsub(inbound)
+	psub, err := client.Subscribe(*redistopic)
+	if err != nil {
+		return
+	}
+
+	defer psub.Close()
 
 	for {
-		in := <-inbound
-		str := in.(string)
+		msg, err := psub.ReceiveMessage()
+		if err != nil {
+			break
+		}
 
-		if grep != "" && !strings.Contains(str, grep) {
+		if grep != "" && !strings.Contains(msg.Payload, grep) {
 			continue
 		}
 
-		err := websocket.Message.Send(ws, str+"\n")
+		err = websocket.Message.Send(ws, msg.Payload+"\n")
 		if err != nil {
 			break
 		}
